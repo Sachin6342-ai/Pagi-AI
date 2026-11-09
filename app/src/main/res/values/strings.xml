@@ -1,0 +1,19 @@
+<resources>
+    <string name="app_name">Pagi AI</string>
+    <string name="hud_subtitle">TACTICAL PERSONAL AI SYSTEM</string>
+    <string name="nav_command">Command</string>
+    <string name="nav_systems">Systems</string>
+    <string name="nav_memory">Memory</string>
+    <string name="nav_routines">Routines</string>
+    <string name="nav_settings">Settings</string>
+    <string name="prompt_placeholder">Speak or type a command (English, Hindi, Hinglish)…</string>
+    <string name="btn_prepare_day">Prepare My Day</string>
+    <string name="btn_confirm">Confirm &amp; Execute</string>
+    <string name="btn_cancel">Cancel</string>
+    <string name="mic_listening">LISTENING</string>
+    <string name="mic_wake_standby">WAKE WORD ACTIVE: \"HEY PAGI\"</string>
+    <string name="mic_speaking">SYNTHESIZING VOICE</string>
+    <string name="mic_processing">ANALYZING NEURAL INTENT</string>
+    <string name="mic_idle">TAP AI CORE OR SAY \"HEY PAGI\"</string>
+    <string name="mic_disabled">VOICE INPUT MUTED</string>
+</resources>

@@ -1,0 +1,6 @@
+{
+  "name": "Pagi AI",
+  "description": "An intelligent, futuristic personal Android AI assistant named Pagi with voice commands, device controls, routines, and personal memory.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
