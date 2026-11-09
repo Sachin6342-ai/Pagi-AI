@@ -67,7 +67,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     private val appContext = application.applicationContext
     private val database = JarvisDatabase.getInstance(appContext)
     private val repository = JarvisRepository(appContext, database.jarvisDao())
-    private val brainService = JarvisBrainService()
+    private val brainService = JarvisBrainService(appContext)
     private val weatherService = WeatherService()
     val actionExecutor = AndroidActionExecutor(appContext)
 
@@ -277,8 +277,10 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
                 preferredLanguage = _preferences.value.preferredLanguage,
                 deviceTelemetrySummary = telemetryStr
             ).getOrElse { error ->
-                _statusBannerMessage.value = error.localizedMessage ?: "Cloud AI unreachable; using local command engine."
-                brainService.buildOfflineFallbackResult(command)
+                val diagnosticMsg = error.localizedMessage
+                    ?: "Unable to reach Gemini AI service. Please check your internet connection."
+                _statusBannerMessage.value = diagnosticMsg
+                brainService.buildOfflineFallbackResult(command, diagnosticMsg)
             }
 
             // Save any newly learned preference or personal memory

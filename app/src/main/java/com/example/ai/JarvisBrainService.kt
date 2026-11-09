@@ -1,24 +1,60 @@
 package com.example.ai
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.util.Base64
 import android.util.Log
+import com.example.BuildConfig
+import com.example.core.FirebaseSafeInitializer
 import com.example.data.local.ChatMessageEntity
 import com.example.data.local.MemoryFactEntity
 import com.example.data.local.NoteEntity
 import com.example.data.local.RoutineEntity
 import com.example.data.local.TodoItemEntity
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.Schema
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLException
 
 private const val TAG = "JarvisBrainService"
+
+enum class GeminiErrorCategory {
+    NETWORK_CONNECTION,
+    TIMEOUT,
+    INVALID_API_KEY_OR_AUTH,
+    QUOTA_EXCEEDED,
+    SERVER_ERROR,
+    FIREBASE_CONFIG_MISSING,
+    UNKNOWN
+}
+
+class GeminiServiceException(
+    val category: GeminiErrorCategory,
+    val userFriendlyMessage: String,
+    cause: Throwable? = null
+) : Exception(userFriendlyMessage, cause)
 
 data class ParsedCommandAction(
     val actionType: String,
@@ -40,7 +76,15 @@ data class JarvisBrainResult(
     val memoryValueToSave: String = ""
 )
 
-class JarvisBrainService {
+class JarvisBrainService(private val context: Context? = null) {
+
+    private val httpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .writeTimeout(20, TimeUnit.SECONDS)
+            .build()
+    }
 
     private val actionItemSchema = Schema.obj(
         properties = mapOf(
@@ -143,6 +187,216 @@ class JarvisBrainService {
         )
     }
 
+    /**
+     * Safely resolves an optional Gemini API key injected into BuildConfig via .env / Secrets
+     * without requiring a hardcoded BuildConfig field when using Firebase AI Logic.
+     */
+    private fun resolveOptionalApiKey(): String? {
+        return try {
+            val field = BuildConfig::class.java.declaredFields.firstOrNull {
+                it.name.equals("GEMINI_API_KEY", ignoreCase = true)
+            } ?: return null
+            field.isAccessible = true
+            val value = (field.get(null) as? String)?.trim().orEmpty()
+            if (value.isNotBlank() &&
+                !value.equals("MY_GEMINI_API_KEY", ignoreCase = true) &&
+                !value.equals("YOUR_API_KEY", ignoreCase = true) &&
+                !value.startsWith("PLACEHOLDER", ignoreCase = true)
+            ) {
+                value
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun ensureInternetConnected() {
+        val ctx = context ?: return
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val activeNet = cm?.activeNetwork
+        val caps = activeNet?.let { cm.getNetworkCapabilities(it) }
+        val hasInternet = caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        if (!hasInternet) {
+            throw GeminiServiceException(
+                category = GeminiErrorCategory.NETWORK_CONNECTION,
+                userFriendlyMessage = "No internet connection detected. Please connect to Wi-Fi or mobile data and try again."
+            )
+        }
+    }
+
+    private fun isFirebaseReady(): Boolean {
+        val ctx = context ?: return false
+        return FirebaseSafeInitializer.ensureInitialized(ctx) && FirebaseApp.getApps(ctx).isNotEmpty()
+    }
+
+    fun classifyException(error: Throwable): GeminiServiceException {
+        if (error is GeminiServiceException) return error
+
+        val msg = error.message.orEmpty()
+        val lower = msg.lowercase()
+
+        return when {
+            error is TimeoutCancellationException || error is SocketTimeoutException || lower.contains("timed out") || lower.contains("timeout") -> {
+                GeminiServiceException(
+                    category = GeminiErrorCategory.TIMEOUT,
+                    userFriendlyMessage = "Gemini AI request timed out. Please check your connection speed and try again.",
+                    cause = error
+                )
+            }
+
+            error is UnknownHostException || error is ConnectException || error is SSLException || error is IOException ||
+                lower.contains("unable to resolve host") || lower.contains("failed to connect") || lower.contains("network is unreachable") -> {
+                GeminiServiceException(
+                    category = GeminiErrorCategory.NETWORK_CONNECTION,
+                    userFriendlyMessage = "Network connection error: Unable to reach Google Gemini servers. Please check your Wi-Fi or mobile data connection.",
+                    cause = error
+                )
+            }
+
+            lower.contains("default firebaseapp is not initialized") -> {
+                GeminiServiceException(
+                    category = GeminiErrorCategory.FIREBASE_CONFIG_MISSING,
+                    userFriendlyMessage = "Firebase is not initialized because app/google-services.json was missing when the APK was built. Add app/google-services.json or configure GEMINI_API_KEY in Secrets.",
+                    cause = error
+                )
+            }
+
+            lower.contains("429") || lower.contains("quota") || lower.contains("resource_exhausted") || lower.contains("rate limit") -> {
+                GeminiServiceException(
+                    category = GeminiErrorCategory.QUOTA_EXCEEDED,
+                    userFriendlyMessage = "Gemini API quota or rate limit exceeded (HTTP 429). Please wait a moment and try again.",
+                    cause = error
+                )
+            }
+
+            lower.contains("401") || lower.contains("403") || lower.contains("api_key_invalid") ||
+                lower.contains("api key not valid") || lower.contains("permission_denied") ||
+                lower.contains("app check") || lower.contains("attestation") || lower.contains("unauthenticated") -> {
+                GeminiServiceException(
+                    category = GeminiErrorCategory.INVALID_API_KEY_OR_AUTH,
+                    userFriendlyMessage = "Authentication / App Check error (HTTP 401/403): Ensure your APK signing key (SHA-1/SHA-256) and app/google-services.json match your Firebase project, or configure a valid GEMINI_API_KEY in Secrets.",
+                    cause = error
+                )
+            }
+
+            lower.contains("500") || lower.contains("502") || lower.contains("503") || lower.contains("504") ||
+                lower.contains("internal") || lower.contains("unavailable") || lower.contains("overloaded") -> {
+                GeminiServiceException(
+                    category = GeminiErrorCategory.SERVER_ERROR,
+                    userFriendlyMessage = "Google Gemini server error (HTTP 5xx): The AI service is temporarily unavailable. Please try again shortly.",
+                    cause = error
+                )
+            }
+
+            else -> {
+                GeminiServiceException(
+                    category = GeminiErrorCategory.UNKNOWN,
+                    userFriendlyMessage = "Gemini AI error: ${error.localizedMessage ?: "Unexpected response from cloud service."}",
+                    cause = error
+                )
+            }
+        }
+    }
+
+    /**
+     * Direct REST call via OkHttp when a GEMINI_API_KEY is configured in .env / BuildConfig
+     * and Firebase AI Logic is either unconfigured in a standalone CI build or rejected by App Check on an external device.
+     */
+    private suspend fun callGeminiRestApi(
+        prompt: String,
+        apiKey: String,
+        expectJson: Boolean = false,
+        inlineBitmap: Bitmap? = null
+    ): String = withContext(Dispatchers.IO) {
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+
+        val partsArray = JSONArray()
+        if (inlineBitmap != null) {
+            val stream = ByteArrayOutputStream()
+            inlineBitmap.compress(Bitmap.CompressFormat.JPEG, 85, stream)
+            val base64Image = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+            partsArray.put(
+                JSONObject().put(
+                    "inline_data",
+                    JSONObject()
+                        .put("mime_type", "image/jpeg")
+                        .put("data", base64Image)
+                )
+            )
+        }
+        partsArray.put(JSONObject().put("text", prompt))
+
+        val payload = JSONObject().apply {
+            put(
+                "contents",
+                JSONArray().put(
+                    JSONObject().put("parts", partsArray)
+                )
+            )
+            if (expectJson) {
+                put(
+                    "generationConfig",
+                    JSONObject().put("responseMimeType", "application/json")
+                )
+            }
+        }
+
+        val request = Request.Builder()
+            .url(url)
+            .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                val apiErrorMsg = try {
+                    JSONObject(responseBody).optJSONObject("error")?.optString("message").orEmpty()
+                } catch (_: Exception) {
+                    ""
+                }
+                val detail = apiErrorMsg.ifBlank { "HTTP ${response.code}" }
+                throw when (response.code) {
+                    400 -> GeminiServiceException(
+                        GeminiErrorCategory.INVALID_API_KEY_OR_AUTH,
+                        "Invalid Gemini API request or key (HTTP 400): $detail"
+                    )
+                    401, 403 -> GeminiServiceException(
+                        GeminiErrorCategory.INVALID_API_KEY_OR_AUTH,
+                        "Invalid or unauthorized Gemini API key (HTTP ${response.code}): $detail"
+                    )
+                    429 -> GeminiServiceException(
+                        GeminiErrorCategory.QUOTA_EXCEEDED,
+                        "Gemini API quota or rate limit exceeded (HTTP 429): $detail"
+                    )
+                    in 500..599 -> GeminiServiceException(
+                        GeminiErrorCategory.SERVER_ERROR,
+                        "Gemini server error (HTTP ${response.code}): $detail"
+                    )
+                    else -> GeminiServiceException(
+                        GeminiErrorCategory.UNKNOWN,
+                        "Gemini API HTTP ${response.code}: $detail"
+                    )
+                }
+            }
+
+            val root = JSONObject(responseBody)
+            val candidates = root.optJSONArray("candidates")
+            val firstCandidate = candidates?.optJSONObject(0)
+            val contentObj = firstCandidate?.optJSONObject("content")
+            val parts = contentObj?.optJSONArray("parts")
+            val text = parts?.optJSONObject(0)?.optString("text").orEmpty()
+            if (text.isBlank()) {
+                throw GeminiServiceException(
+                    GeminiErrorCategory.UNKNOWN,
+                    "Gemini API returned an empty response payload."
+                )
+            }
+            text
+        }
+    }
+
     suspend fun processUserCommand(
         userPrompt: String,
         recentHistory: List<ChatMessageEntity>,
@@ -191,6 +445,7 @@ class JarvisBrainService {
                - `NAVIGATE_MAPS` / `SEARCH_MAPS`: put destination or place query in `targetNumberOrQuery` and place name in `targetName`.
                - `WEATHER_LOOKUP`: put city name in `targetNumberOrQuery` (or leave empty for current city).
                - `PREPARE_MY_DAY`: use when the user says "Pagi, prepare my day", "Morning briefing", "Din ki taiyari karo", or similar daily routine commands.
+            7. JSON Schema Format: Return a JSON object with keys: "spokenReply" (string), "detailedReply" (string), "detectedLanguage" ("en"|"hi"|"hinglish"), "needsClarification" (boolean), "actions" (array of objects with "actionType", "targetName", "targetNumberOrQuery", "messageBody", "numericValue", "extraMode", "requiresConfirmation"), "memoryKeyToSave" (string), "memoryValueToSave" (string).
 
             USER CONTEXT & MEMORY:
             - Saved Personal Memory: $memoryContext
@@ -207,20 +462,50 @@ class JarvisBrainService {
         """.trimIndent()
 
         return try {
-            val response = withTimeout(60_000L) {
-                structuredModel.generateContent(fullPrompt)
+            ensureInternetConnected()
+            val firebaseReady = isFirebaseReady()
+            val optionalApiKey = resolveOptionalApiKey()
+
+            val jsonText = if (firebaseReady) {
+                try {
+                    val response = withTimeout(60_000L) {
+                        structuredModel.generateContent(fullPrompt)
+                    }
+                    response.text ?: throw IllegalStateException("Gemini returned an empty response.")
+                } catch (firebaseErr: Exception) {
+                    if (firebaseErr is CancellationException && firebaseErr !is TimeoutCancellationException) {
+                        throw firebaseErr
+                    }
+                    if (!optionalApiKey.isNullOrBlank()) {
+                        Log.w(TAG, "Firebase AI Logic call failed; falling back to configured GEMINI_API_KEY REST endpoint.", firebaseErr)
+                        callGeminiRestApi(fullPrompt, optionalApiKey, expectJson = true)
+                    } else {
+                        throw firebaseErr
+                    }
+                }
+            } else if (!optionalApiKey.isNullOrBlank()) {
+                callGeminiRestApi(fullPrompt, optionalApiKey, expectJson = true)
+            } else {
+                throw GeminiServiceException(
+                    category = GeminiErrorCategory.FIREBASE_CONFIG_MISSING,
+                    userFriendlyMessage = "Firebase configuration (app/google-services.json) was not bundled when this APK was compiled. Include app/google-services.json in your repository or configure GEMINI_API_KEY in Secrets."
+                )
             }
-            val jsonText = response.text ?: throw IllegalStateException("Empty AI response")
+
             val parsed = parseStructuredJson(jsonText)
             Result.success(parsed)
-        } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Gemini command processing timed out", e)
-            Result.failure(IllegalStateException("AI request timed out after 60 seconds. Executing offline fallback if applicable."))
         } catch (e: CancellationException) {
-            throw e
+            if (e is TimeoutCancellationException) {
+                val classified = classifyException(e)
+                Log.e(TAG, "Gemini command processing timed out: ${classified.userFriendlyMessage}", e)
+                Result.failure(classified)
+            } else {
+                throw e
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Gemini command processing failed", e)
-            Result.failure(e)
+            val classified = classifyException(e)
+            Log.e(TAG, "Gemini command processing failed [${classified.category}]: ${classified.userFriendlyMessage}", e)
+            Result.failure(classified)
         }
     }
 
@@ -247,10 +532,35 @@ class JarvisBrainService {
         """.trimIndent()
 
         return try {
-            val response = withTimeout(60_000L) {
-                generalModel.generateContent(prompt)
+            ensureInternetConnected()
+            val firebaseReady = isFirebaseReady()
+            val optionalApiKey = resolveOptionalApiKey()
+
+            val fullText = if (firebaseReady) {
+                try {
+                    val response = withTimeout(60_000L) {
+                        generalModel.generateContent(prompt)
+                    }
+                    response.text.orEmpty().trim()
+                } catch (firebaseErr: Exception) {
+                    if (firebaseErr is CancellationException && firebaseErr !is TimeoutCancellationException) {
+                        throw firebaseErr
+                    }
+                    if (!optionalApiKey.isNullOrBlank()) {
+                        callGeminiRestApi(prompt, optionalApiKey, expectJson = false).trim()
+                    } else {
+                        throw firebaseErr
+                    }
+                }
+            } else if (!optionalApiKey.isNullOrBlank()) {
+                callGeminiRestApi(prompt, optionalApiKey, expectJson = false).trim()
+            } else {
+                throw GeminiServiceException(
+                    category = GeminiErrorCategory.FIREBASE_CONFIG_MISSING,
+                    userFriendlyMessage = "Firebase configuration missing."
+                )
             }
-            val fullText = response.text.orEmpty().trim()
+
             if (fullText.contains("---DETAIL---")) {
                 val parts = fullText.split("---DETAIL---", limit = 2)
                 Result.success(parts[0].trim() to parts[1].trim())
@@ -259,9 +569,12 @@ class JarvisBrainService {
                 Result.success(firstSentences to fullText)
             }
         } catch (e: CancellationException) {
-            throw e
+            if (e !is TimeoutCancellationException) throw e
+            val fallbackSpoken = "Good day! Here is your briefing: $weatherSummary. You have $todosSummary."
+            val fallbackDetail = "### Daily Briefing\n- **Calendar**: $calendarSummary\n- **Tasks**: $todosSummary\n- **Weather**: $weatherSummary\n- **System**: $batteryAndNetwork"
+            Result.success(fallbackSpoken to fallbackDetail)
         } catch (e: Exception) {
-            Log.e(TAG, "Daily briefing synthesis failed", e)
+            Log.e(TAG, "Daily briefing synthesis fallback used", e)
             val fallbackSpoken = "Good day! Here is your briefing: $weatherSummary. You have $todosSummary."
             val fallbackDetail = "### Daily Briefing\n- **Calendar**: $calendarSummary\n- **Tasks**: $todosSummary\n- **Weather**: $weatherSummary\n- **System**: $batteryAndNetwork"
             Result.success(fallbackSpoken to fallbackDetail)
@@ -269,34 +582,74 @@ class JarvisBrainService {
     }
 
     suspend fun analyzeCapturedPhoto(bitmap: Bitmap, userQuestion: String): Result<String> {
+        val visionPrompt = "You are PAGI AI analyzing an image captured by the user's camera. " +
+            "User request: ${userQuestion.ifBlank { "Describe what you see, extract any key text or actionable details, and advise how you can help." }}"
         return try {
-            val response = withTimeout(60_000L) {
-                generalModel.generateContent(
-                    content {
-                        image(bitmap)
-                        text(
-                            "You are PAGI AI analyzing an image captured by the user's camera. " +
-                                "User request: ${userQuestion.ifBlank { "Describe what you see, extract any key text or actionable details, and advise how you can help." }}"
+            ensureInternetConnected()
+            val firebaseReady = isFirebaseReady()
+            val optionalApiKey = resolveOptionalApiKey()
+
+            val text = if (firebaseReady) {
+                try {
+                    val response = withTimeout(60_000L) {
+                        generalModel.generateContent(
+                            content {
+                                image(bitmap)
+                                text(visionPrompt)
+                            }
                         )
                     }
+                    response.text.orEmpty()
+                } catch (firebaseErr: Exception) {
+                    if (firebaseErr is CancellationException && firebaseErr !is TimeoutCancellationException) {
+                        throw firebaseErr
+                    }
+                    if (!optionalApiKey.isNullOrBlank()) {
+                        callGeminiRestApi(visionPrompt, optionalApiKey, expectJson = false, inlineBitmap = bitmap)
+                    } else {
+                        throw firebaseErr
+                    }
+                }
+            } else if (!optionalApiKey.isNullOrBlank()) {
+                callGeminiRestApi(visionPrompt, optionalApiKey, expectJson = false, inlineBitmap = bitmap)
+            } else {
+                throw GeminiServiceException(
+                    category = GeminiErrorCategory.FIREBASE_CONFIG_MISSING,
+                    userFriendlyMessage = "Firebase configuration (app/google-services.json) or GEMINI_API_KEY is required for camera vision analysis."
                 )
             }
-            val text = response.text
-            if (!text.isNullOrBlank()) {
+
+            if (text.isNotBlank()) {
                 Result.success(text.trim())
             } else {
-                Result.failure(IllegalStateException("Model returned an empty vision analysis."))
+                Result.failure(
+                    GeminiServiceException(
+                        GeminiErrorCategory.UNKNOWN,
+                        "Gemini Vision returned an empty response."
+                    )
+                )
             }
         } catch (e: CancellationException) {
-            throw e
+            if (e is TimeoutCancellationException) {
+                Result.failure(classifyException(e))
+            } else {
+                throw e
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Vision analysis failed", e)
-            Result.failure(e)
+            val classified = classifyException(e)
+            Log.e(TAG, "Vision analysis failed: ${classified.userFriendlyMessage}", e)
+            Result.failure(classified)
         }
     }
 
     private fun parseStructuredJson(jsonString: String): JarvisBrainResult {
-        val json = JSONObject(jsonString)
+        val cleanedJson = jsonString
+            .trim()
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+        val json = JSONObject(cleanedJson)
         val spokenReply = json.optString("spokenReply", "Right away.")
         val detailedReply = json.optString("detailedReply", "")
         val detectedLanguage = json.optString("detectedLanguage", "en")
@@ -341,9 +694,13 @@ class JarvisBrainService {
     }
 
     /**
-     * Local resilient intent parser so hardware & phone controls still work if offline or if AI times out.
+     * Local resilient intent parser so hardware & phone controls still work if offline or if AI times out,
+     * while surfacing specific diagnostic error messages for cloud queries.
      */
-    fun buildOfflineFallbackResult(prompt: String): JarvisBrainResult {
+    fun buildOfflineFallbackResult(
+        prompt: String,
+        diagnosticError: String? = null
+    ): JarvisBrainResult {
         val lower = prompt.lowercase().trim()
         val actions = mutableListOf<ParsedCommandAction>()
 
@@ -376,7 +733,6 @@ class JarvisBrainService {
             actions.add(ParsedCommandAction(actionType = "OPEN_REAR_CAMERA"))
         }
 
-        // Send message pattern: "send <name> a message that <text>"
         val sendRegex = Regex("send\\s+([a-zA-Z]+)\\s+(?:a\\s+)?(?:whatsapp\\s+|sms\\s+)?message\\s+(?:that\\s+|saying\\s+)?(.+)", RegexOption.IGNORE_CASE)
         sendRegex.find(prompt)?.let { match ->
             val recipient = match.groupValues[1]
@@ -399,8 +755,12 @@ class JarvisBrainService {
             )
         }
 
+        val specificReason = diagnosticError?.takeIf { it.isNotBlank() }
+            ?: "Unable to reach the Gemini AI service. Please verify your internet connection and Firebase configuration."
+
         return JarvisBrainResult(
-            spokenReply = "I encountered a network issue reaching the Gemini cloud core, but local device controls (flashlight, alarms, calls, messages, notes, and routines) remain operational.",
+            spokenReply = specificReason,
+            detailedReply = "### Diagnostic Details\n- **Issue**: $specificReason\n- **Local Controls Available**: Flashlight, Battery & Network checks, Calls, SMS/WhatsApp, Alarms, Timers, Notes, To-Dos, and Routines remain fully operational.",
             actions = emptyList()
         )
     }

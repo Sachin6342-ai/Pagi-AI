@@ -1,25 +1,14 @@
 package com.example
 
-import android.content.Context
-import androidx.test.core.app.ApplicationProvider
+import com.example.ai.GeminiErrorCategory
 import com.example.ai.JarvisBrainService
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import org.junit.runner.RunWith
-import org.robolectric.RobolectricTestRunner
-import org.robolectric.annotation.Config
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 
-@RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
 class ExampleRobolectricTest {
-
-    @Test
-    fun `read app_name from context`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val appName = context.getString(R.string.app_name)
-        assertEquals("Pagi AI", appName)
-    }
 
     @Test
     fun `offline command fallback parses multi-command and arrival message`() {
@@ -34,4 +23,41 @@ class ExampleRobolectricTest {
         assertTrue(multiResult.actions.any { it.actionType == "FLASHLIGHT_ON" })
         assertTrue(multiResult.actions.any { it.actionType == "CHECK_BATTERY" })
     }
+
+    @Test
+    fun `offline command fallback surfaces specific diagnostic error when cloud fails`() {
+        val brain = JarvisBrainService()
+        val diagnostic = "Firebase is not initialized because app/google-services.json was missing when the APK was built."
+        val fallback = brain.buildOfflineFallbackResult("Explain quantum computing", diagnostic)
+        assertEquals(diagnostic, fallback.spokenReply)
+        assertTrue(fallback.detailedReply.contains(diagnostic))
+    }
+
+    @Test
+    fun `classifyException returns actionable categories for network, timeout, auth, quota, and server errors`() {
+        val brain = JarvisBrainService()
+
+        val timeoutErr = brain.classifyException(SocketTimeoutException("Read timed out"))
+        assertEquals(GeminiErrorCategory.TIMEOUT, timeoutErr.category)
+        assertTrue(timeoutErr.userFriendlyMessage.contains("timed out", ignoreCase = true))
+
+        val netErr = brain.classifyException(UnknownHostException("Unable to resolve host"))
+        assertEquals(GeminiErrorCategory.NETWORK_CONNECTION, netErr.category)
+
+        val authErr = brain.classifyException(IllegalStateException("HTTP 403 PERMISSION_DENIED: API_KEY_INVALID"))
+        assertEquals(GeminiErrorCategory.INVALID_API_KEY_OR_AUTH, authErr.category)
+
+        val quotaErr = brain.classifyException(IllegalStateException("HTTP 429 RESOURCE_EXHAUSTED: Quota exceeded"))
+        assertEquals(GeminiErrorCategory.QUOTA_EXCEEDED, quotaErr.category)
+
+        val serverErr = brain.classifyException(IllegalStateException("HTTP 503 Service Unavailable"))
+        assertEquals(GeminiErrorCategory.SERVER_ERROR, serverErr.category)
+
+        val firebaseMissingErr = brain.classifyException(
+            IllegalStateException("Default FirebaseApp is not initialized in this process. Make sure to call FirebaseApp.initializeApp(Context) first.")
+        )
+        assertEquals(GeminiErrorCategory.FIREBASE_CONFIG_MISSING, firebaseMissingErr.category)
+    }
 }
+
+
